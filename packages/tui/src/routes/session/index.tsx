@@ -84,7 +84,8 @@ import { useToast } from "../../ui/toast"
 import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
 import { usePromptRestore } from "../../prompt/restore"
-import { restoreToTab } from "../../component/prompt/draft-stash"
+import { appendToSessionPrompt } from "../../component/prompt/draft-stash"
+import type { ProjectedPrompt } from "../../prompt/codec"
 import { deduplicateVisibleImages } from "../../prompt/attachment"
 import { useEpilogue } from "../../context/epilogue"
 import { normalizePath } from "../../util/path"
@@ -774,6 +775,14 @@ export function Session(props: {
   }
   const mutatePending = async (action: PendingAction, inboxID: string) =>
     (await runPendingAction(inboxID, () => requestPending(action, inboxID))) ?? false
+  // The cancel releases blobs nothing else references, so media refs load into the draft first. Resolves with the
+  // composer it wrote to, if any, once the prompt is back; undefined if the cancel failed or was already running.
+  const undoPending = (inboxID: string, message: ProjectedPrompt, failureLabel?: string) =>
+    runPendingAction(inboxID, async () => {
+      const restored = await restorePrompt(message)
+      if (!(await requestPending("cancel", inboxID, failureLabel))) return
+      return { composer: appendToSessionPrompt(sessionID, restored, renderer.widthMethod) }
+    })
   const openQueuedPrompts = () =>
     dialog.replace(() => (
       <DialogSelect
@@ -812,21 +821,19 @@ export function Session(props: {
                 toast.show({ message: "Leave shell mode before undoing a queued prompt", variant: "error" })
                 return
               }
-              // The cancel sweeps blobs nothing else references, so media refs load into the draft first.
-              void runPendingAction(queued.id, async () => {
-                const restored = await restorePrompt(queued.payload)
-                if (!(await requestPending("cancel", queued.id, "undo"))) return
-                const composer = restoreToTab(sessionID, restored, renderer.widthMethod)
-                if (sessionDisposed) return
-                dialog.clear()
-                composer?.focus()
-              }).catch((error) =>
-                toast.show({
-                  title: "Failed to undo pending prompt",
-                  message: errorMessage(error),
-                  variant: "error",
-                }),
-              )
+              void undoPending(queued.id, queued.payload, "undo")
+                .then((undone) => {
+                  if (!undone || sessionDisposed) return
+                  dialog.clear()
+                  undone.composer?.focus()
+                })
+                .catch((error) =>
+                  toast.show({
+                    title: "Failed to undo pending prompt",
+                    message: errorMessage(error),
+                    variant: "error",
+                  }),
+                )
             },
           },
         ]}
@@ -1063,13 +1070,7 @@ export function Session(props: {
       group: "Session",
       slash: { name: "timeline" },
       run: () => {
-        dialog.replace(() => (
-          <DialogTimeline
-            sessionID={route.sessionID}
-            onMove={jumpToMessage}
-            setPrompt={(value) => restoreToTab(sessionID, value, renderer.widthMethod)}
-          />
-        ))
+        dialog.replace(() => <DialogTimeline sessionID={route.sessionID} onMove={jumpToMessage} />)
       },
     },
     {
@@ -1127,21 +1128,16 @@ export function Session(props: {
           dialog.clear()
           return
         }
-        const pending = pendingDeliveries().has(message.id)
-        const undo = async () => {
-          const restored = await restorePrompt(message)
-          if (pending) {
-            if (!(await requestPending("cancel", message.id))) return
-          } else {
-            await client.api.session.interrupt({ sessionID })
-            await client.api.experimental.session.wait({ sessionID })
-            await client.api.session.revert.stage({ sessionID, messageID: message.id })
-          }
-          restoreToTab(sessionID, restored, renderer.widthMethod)
-        }
-        void (pending ? runPendingAction(message.id, undo) : undo()).catch((error) =>
-          toast.show({ message: errorMessage(error), variant: "error", duration: 5000 }),
-        )
+        const undo = pendingDeliveries().has(message.id)
+          ? undoPending(message.id, message)
+          : (async () => {
+              const restored = await restorePrompt(message)
+              await client.api.session.interrupt({ sessionID })
+              await client.api.experimental.session.wait({ sessionID })
+              await client.api.session.revert.stage({ sessionID, messageID: message.id })
+              appendToSessionPrompt(sessionID, restored, renderer.widthMethod)
+            })()
+        void undo.catch((error) => toast.show({ message: errorMessage(error), variant: "error", duration: 5000 }))
         dialog.clear()
       },
     },
@@ -1515,7 +1511,6 @@ export function Session(props: {
         legacyTurns: legacy,
         config,
         mutatePending,
-        setPrompt: (value) => restoreToTab(sessionID, value, renderer.widthMethod),
         pendingDelivery: (inboxID) => pendingDeliveries().get(inboxID),
       }}
     >
@@ -2424,9 +2419,7 @@ function UserMessage(props: { message: SessionMessageUser }) {
             }
             // The dialog outlives this row, whose props go stale when a resync drops the message.
             const messageID = props.message.id
-            dialog.replace(() => (
-              <DialogMessage messageID={messageID} sessionID={ctx.sessionID} setPrompt={ctx.setPrompt} />
-            ))
+            dialog.replace(() => <DialogMessage messageID={messageID} sessionID={ctx.sessionID} />)
           }}
           paddingTop={1}
           paddingBottom={1}
@@ -2684,7 +2677,6 @@ function SessionImages(props: { images: readonly { uri: string }[]; paddingLeft?
       >
         <For each={visible()}>
           {(image, index) => {
-            const [failed, setFailed] = createSignal(false)
             const media = createMediaSource(() => image.uri)
             return (
               <box
@@ -2700,14 +2692,14 @@ function SessionImages(props: { images: readonly { uri: string }[]; paddingLeft?
                   dialog.replace(() => <DialogImagePreview images={images()} initial={index()} />)
                 }}
               >
-                <Show when={!failed() && !media.failed()} fallback={<text>No preview</text>}>
+                <Show when={!media.failed()} fallback={<text>No preview</text>}>
                   <image
                     source={media.source()}
                     fit="cover"
                     protocol="auto"
                     width="100%"
                     height="100%"
-                    onError={() => setFailed(true)}
+                    onError={media.onError}
                   />
                 </Show>
               </box>
